@@ -1,35 +1,3 @@
-"""YOUKO HUB: Telegram ingest and optional eggPing feed monitor.
-
-The eggPing poller is opt-in. Enable only when automated access is permitted.
-"""
-import hmac
-import os
-import re
-import threading
-import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-import requests
-from flask import Flask, jsonify, request
-
-app = Flask(__name__)
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
-INGEST_KEY = os.getenv('INGEST_API_KEY', '').strip()
-MONITOR_ENABLED = os.getenv('EGGPING_MONITOR_ENABLED', 'false').lower() == 'true'
-MONITOR_URL = 'https://eggping.com/api/live'
-POLL_SECONDS = max(60, int(os.getenv('EGGPING_POLL_SECONDS', '90')))
-TZ = ZoneInfo('Asia/Phnom_Penh')
-SEEN = {}
-LOCK = threading.Lock()
-STATUS = {'running': False, 'last_check': None, 'last_error': None, 'baseline': False}
-
-
-def clean(value, limit=120):
-    return re.sub(r'[\x00-\x1f\x7f]', ' ', str(value or '')).strip()[:limit]
-
-
 def local_time(at_ms=None):
     when = datetime.fromtimestamp(at_ms / 1000, TZ) if at_ms else datetime.now(TZ)
     return when.strftime('%Y-%m-%d %H:%M:%S')
@@ -126,3 +94,35 @@ def ingest():
     name = clean(data.get('name'))
     event_id = clean(data.get('event_id'), 150)
     if not name or not event_id:
+        return jsonify(error='name and unique event_id required'), 400
+    rarity = clean(data.get('rarity'), 20).title()
+    if kind == 'spawn' and rarity not in ('Secret', 'Eternal', 'Divine'):
+        return jsonify(error='invalid rarity'), 400
+    with LOCK:
+        clean_seen()
+        if 'ingest:' + event_id in SEEN:
+            return jsonify(status='duplicate', sent=False)
+        if kind == 'spawn':
+            message = spawn_message({
+                'rarity': rarity, 'name': name,
+                'biome': data.get('location'),
+                'facts': {'income': data.get('income'), 'speed': data.get('speed')},
+            }).replace('📡 Source: eggPing (unofficial report)', '📡 Source: authorized ingest')
+        else:
+            message = (f'🌊 YOUKO HUB — GAME EVENT\n\n📣 Event: {name}\n'
+                       f'🌍 Location: {clean(data.get("location") or "Not provided")}\n'
+                       f'🕒 Cambodia: {local_time()}')
+        try:
+            send_telegram(message)
+        except (requests.RequestException, RuntimeError):
+            app.logger.exception('Telegram delivery failed')
+            return jsonify(error='telegram_delivery_failed'), 502
+        SEEN['ingest:' + event_id] = time.time() + 86400
+    return jsonify(status='sent', sent=True)
+
+
+if MONITOR_ENABLED:
+    threading.Thread(target=monitor_loop, name='eggping-poller', daemon=True).start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')))
