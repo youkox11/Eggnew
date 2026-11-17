@@ -1,3 +1,35 @@
+"""YOUKO HUB: Telegram ingest and optional eggPing feed monitor.
+
+The eggPing poller is opt-in. Enable only when automated access is permitted.
+"""
+import hmac
+import os
+import re
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+INGEST_KEY = os.getenv('INGEST_API_KEY', '').strip()
+MONITOR_ENABLED = os.getenv('EGGPING_MONITOR_ENABLED', 'false').lower() == 'true'
+MONITOR_URL = 'https://eggping.com/api/live'
+POLL_SECONDS = max(60, int(os.getenv('EGGPING_POLL_SECONDS', '90')))
+TZ = ZoneInfo('Asia/Phnom_Penh')
+SEEN = {}
+LOCK = threading.Lock()
+STATUS = {'running': False, 'last_check': None, 'last_error': None, 'baseline': False}
+
+
+def clean(value, limit=120):
+    return re.sub(r'[\x00-\x1f\x7f]', ' ', str(value or '')).strip()[:limit]
+
+
 def local_time(at_ms=None):
     when = datetime.fromtimestamp(at_ms / 1000, TZ) if at_ms else datetime.now(TZ)
     return when.strftime('%Y-%m-%d %H:%M:%S')
