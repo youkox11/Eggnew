@@ -221,11 +221,27 @@ def discord_worker():
                 for f in embed.fields
             }
 
+
             def get_field(*names):
                 for name in names:
                     if fields.get(name):
                         return fields[name]
+
+                text = re.sub(r"<a?:\w+:\d+>", "", description)
+                text = text.replace("**", "").replace("__", "")
+
+                for name in names:
+                    match = re.search(
+                        rf"\b{re.escape(name)}\s*:\s*([^\r\n]+)",
+                        text,
+                        re.IGNORECASE,
+                    )
+                    if match:
+                        return match.group(1).strip()
+
                 return "N/A"
+
+
 
             egg = get_field("egg", "egg name")
             location = get_field("location", "biome")
