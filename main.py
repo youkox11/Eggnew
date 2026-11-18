@@ -153,6 +153,142 @@ def ingest():
     return jsonify(status='sent', sent=True)
 
 
+import html
+import asyncio
+import discord
+
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL_ID", "").strip()
+
+RARITY_ICONS = {
+    "SECRET": "⚫",
+    "ETERNAL": "🟣",
+    "DIVINE": "🟡",
+}
+
+def send_discord_alert(message):
+    response = requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+        timeout=15,
+    )
+    if not response.ok:
+        raise RuntimeError("Telegram delivery failed")
+
+def discord_worker():
+    intents = discord.Intents.default()
+    intents.message_content = True
+    client = discord.Client(intents=intents)
+
+    @client.event
+    async def on_ready():
+        app.logger.info("YOUKO HUB Discord connected")
+
+    @client.event
+    async def on_message(message):
+        if str(message.channel.id) != DISCORD_CHANNEL:
+            return
+
+        if not (message.webhook_id or message.author.bot):
+            return
+
+        for index, embed in enumerate(message.embeds):
+            title = embed.title or ""
+            description = embed.description or ""
+
+            rarity = next(
+                (
+                    r for r in RARITY_ICONS
+                    if re.search(
+                        rf"\b{r}\s+EGG\s+SPAWNED\b",
+                        title + "\n" + description,
+                        re.I,
+                    )
+                ),
+                None,
+            )
+
+            if not rarity:
+                continue
+
+            fields = {
+                re.sub(r"[^a-z ]", "", f.name.lower()).strip(): f.value
+                for f in embed.fields
+            }
+
+            def get_field(*names):
+                for name in names:
+                    if fields.get(name):
+                        return fields[name]
+                return "N/A"
+
+            egg = get_field("egg", "egg name")
+            location = get_field("location", "biome")
+            money = get_field("money", "income")
+            speed = get_field("recommended speed", "speed")
+
+            if egg == "N/A":
+                continue
+
+            join = get_field("join game", "join")
+            match = re.search(
+                r"https://[^\s)>]+",
+                join + "\n" + description,
+            )
+
+            game_link = "N/A"
+            if match:
+                url = html.escape(match.group(0), quote=True)
+                game_link = f'<a href="{url}">Click Here</a>'
+
+            esc = html.escape
+
+            alert = (
+                "<b>YOUKO HUB • Auto Notification</b>\n\n"
+                f"<b>{RARITY_ICONS[rarity]} "
+                f"{rarity} EGG SPAWNED!!</b>\n\n"
+                f"🥚 ពង៖ {esc(egg)}\n"
+                f"👽 ទីតាំង៖ {esc(location)}\n"
+                f"💸 Money: {esc(money)}\n"
+                f"🏃 ល្បឿនណែនាំ៖ {esc(speed)}\n"
+                f"🎮 ចូលហ្គេម៖ {game_link}\n"
+                "📡 Source: SenZ V2\n\n"
+                "<b>YOUKO HUB | Steal An Egg Notifier</b>"
+            )
+
+            key = f"discord:{message.id}:{index}"
+
+            def deliver():
+                with LOCK:
+                    clean_seen()
+                    if key in SEEN:
+                        return
+                    send_discord_alert(alert)
+                    SEEN[key] = time.time() + 86400
+
+            try:
+                await asyncio.to_thread(deliver)
+            except Exception:
+                app.logger.error("Discord alert delivery failed")
+
+    try:
+        client.run(DISCORD_TOKEN)
+    except Exception:
+        app.logger.error("Discord connection failed")
+
+if DISCORD_TOKEN and DISCORD_CHANNEL:
+    threading.Thread(
+        target=discord_worker,
+        name="youko-discord",
+        daemon=True,
+    ).start()
+
+
 if MONITOR_ENABLED:
     threading.Thread(target=monitor_loop, name='eggping-poller', daemon=True).start()
 
