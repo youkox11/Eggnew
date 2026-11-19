@@ -180,6 +180,76 @@ def send_discord_alert(message):
     if not response.ok:
         raise RuntimeError("Telegram delivery failed")
 
+import sqlite3
+from contextlib import closing
+from collections import Counter
+
+PREDICTION_DB = os.getenv("PREDICTION_DB", "").strip()
+PREDICTION_INTERVAL = 6 * 86400
+PREDICTION_MIN = 20
+
+def prediction_connect():
+    db = sqlite3.connect(PREDICTION_DB, timeout=15)
+    db.execute("CREATE TABLE IF NOT EXISTS spawns (id TEXT PRIMARY KEY, egg TEXT, location TEXT, ts REAL)")
+    db.execute("CREATE TABLE IF NOT EXISTS schedule (id INTEGER PRIMARY KEY, next_at REAL)")
+    db.execute("INSERT OR IGNORE INTO schedule VALUES (1, ?)", (time.time() + PREDICTION_INTERVAL,))
+    db.commit()
+    return db
+
+def record_divine(key, egg, location, at):
+    if not PREDICTION_DB:
+        return
+    try:
+        with closing(prediction_connect()) as db, db:
+            db.execute("INSERT OR IGNORE INTO spawns VALUES (?, ?, ?, ?)", (key, clean(egg), clean(location), at))
+    except Exception:
+        app.logger.error("Prediction history write failed")
+
+def prediction_report(rows, now):
+    heading = "🔮 YOUKO HUB PREDICTION\nការព្យាករណ៍ពង DIVINE\nរបាយការណ៍ប្រចាំ ៦ ថ្ងៃ | GMT+7\n\n"
+    if len(rows) < PREDICTION_MIN:
+        return heading + f"កំពុងប្រមូលទិន្នន័យ៖ {len(rows)}/{PREDICTION_MIN} ករណី។\nមិនទាន់មានទិន្នន័យគ្រប់គ្រាន់សម្រាប់ព្យាករណ៍ទេ។"
+    counts = Counter(egg.casefold() for egg, loc, ts in rows)
+    latest = {}
+    for egg, loc, ts in rows:
+        latest[egg.casefold()] = (egg, loc, ts)
+    lines = [heading, f"📊 ប្រវត្តិ ៣០ ថ្ងៃ៖ {len(rows)} ករណី\n"]
+    for i, (key, count) in enumerate(counts.most_common(5), 1):
+        egg, loc, ts = latest[key]
+        pct = 100 * count / len(rows)
+        days = max(0, int((now-ts)/86400))
+        lines.append(f"{i}. {egg} — {pct:.1f}%\n{'█'*round(pct/10)}{'░'*(10-round(pct/10))}\n📍 {loc} · បាត់មុខ {days} ថ្ងៃ\n")
+    hours = Counter((datetime.fromtimestamp(ts, TZ).hour // 3)*3 for _, _, ts in rows)
+    def window(h):
+        return f"{h:02d}:00 – {(h+3)%24:02d}:00"
+    peaks = hours.most_common(2)
+    lines.append("⏰ ចន្លោះម៉ោងប៉ាន់ស្មាន (តាមប្រវត្តិ)\n" + window(peaks[0][0]))
+    lines.append("\n📊 ចន្លោះម៉ោងដែលពងចេញញឹកញាប់\n" + "\n".join(window(h) for h, _ in peaks))
+    lines.append("\n⚠️ ភាគរយជាសមាមាត្រនៃប្រវត្តិដែល Bot បានឃើញ មិនមែនឱកាស Spawn ពិតប្រាកដទេ។ ម៉ោងយោងតាមពេលទទួលសារ។\nប្រភព៖ Discord notifier (SenZ V2)\nYOUKO HUB | Steal An Egg Notifier")
+    return "\n".join(lines)
+
+def prediction_tick():
+    now = time.time()
+    with closing(prediction_connect()) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        due = db.execute("SELECT next_at FROM schedule WHERE id=1").fetchone()[0]
+        if now < due:
+            return False
+        rows = db.execute("SELECT egg, location, ts FROM spawns WHERE ts >= ? AND ts <= ? ORDER BY ts", (now-30*86400, now)).fetchall()
+        # Reserve before sending: avoid repeated posts even after a restart.
+        db.execute("UPDATE schedule SET next_at=? WHERE id=1", (now+PREDICTION_INTERVAL,))
+        db.execute("DELETE FROM spawns WHERE ts < ?", (now-90*86400,))
+    send_telegram(prediction_report(rows, now))
+    return True
+
+def prediction_loop():
+    while True:
+        try:
+            prediction_tick()
+        except Exception:
+            app.logger.error("Prediction check or delivery failed")
+        time.sleep(60)
+
 def discord_worker():
     intents = discord.Intents.default()
     intents.message_content = True
@@ -265,21 +335,23 @@ def discord_worker():
             esc = html.escape
 
             alert = (
-                "<b>YOUKO HUB • Auto Notification</b>\n\n"
+              
                 f"<b>{RARITY_ICONS[rarity]} "
                 f"{rarity} EGG SPAWNED!!</b>\n\n"
                 f"🥚 ពង៖ {esc(egg)}\n"
-                f"👽 ទីតាំង៖ {esc(location)}\n"
+                f"📍 ទីតាំង៖ {esc(location)}\n"
                 f"💸 Money: {esc(money)}\n"
                 f"🏃 ល្បឿនណែនាំ៖ {esc(speed)}\n"
-                f"🎮 ចូលហ្គេម៖ {game_link}\n"
-                "📡 Source: SenZ V2\n\n"
+                f"🎮 ចូលហ្គេម៖ {game_link}\n\n"
+
                 "<b>YOUKO HUB | Steal An Egg Notifier</b>"
             )
 
             key = f"discord:{message.id}:{index}"
 
             def deliver():
+                if rarity == "DIVINE":
+                    record_divine(key, egg, location, message.created_at.timestamp())
                 with LOCK:
                     clean_seen()
                     if key in SEEN:
@@ -307,6 +379,9 @@ if DISCORD_TOKEN and DISCORD_CHANNEL:
 
 if MONITOR_ENABLED:
     threading.Thread(target=monitor_loop, name='eggping-poller', daemon=True).start()
+
+if PREDICTION_DB:
+    threading.Thread(target=prediction_loop, name='prediction', daemon=True).start()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')))
