@@ -180,30 +180,60 @@ def send_discord_alert(message):
     if not response.ok:
         raise RuntimeError("Telegram delivery failed")
 
-import sqlite3
+import psycopg
 from contextlib import closing
 from collections import Counter
 
-PREDICTION_DB = os.getenv("PREDICTION_DB", "").strip()
-PREDICTION_INTERVAL = 6 * 86400
+PREDICTION_DB = os.getenv("DATABASE_URL", "").strip()
+from datetime import timedelta
+
+def next_prediction_time(now):
+    current = datetime.fromtimestamp(now, TZ)
+    days = (5 - current.weekday()) % 7
+    target = (current + timedelta(days=days)).replace(
+        hour=8, minute=0, second=0, microsecond=0
+    )
+    if target <= current:
+        target += timedelta(days=7)
+    return target.timestamp()
+
 PREDICTION_MIN = 20
 
 def prediction_connect():
-    db = sqlite3.connect(PREDICTION_DB, timeout=15)
-    db.execute("CREATE TABLE IF NOT EXISTS spawns (id TEXT PRIMARY KEY, egg TEXT, location TEXT, ts REAL)")
-    db.execute("CREATE TABLE IF NOT EXISTS schedule (id INTEGER PRIMARY KEY, next_at REAL)")
-    db.execute("INSERT OR IGNORE INTO schedule VALUES (1, ?)", (time.time() + PREDICTION_INTERVAL,))
-    db.commit()
-    return db
-
+    db = psycopg.connect(
+        PREDICTION_DB,
+        connect_timeout=15,
+        sslmode="require"
+    )
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS spawns (id TEXT PRIMARY KEY, egg TEXT, location TEXT, ts DOUBLE PRECISION)")
+        db.execute("CREATE TABLE IF NOT EXISTS schedule (id INTEGER PRIMARY KEY, next_at DOUBLE PRECISION)")
+        db.execute(
+            "INSERT INTO schedule VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
+            (next_prediction_time(time.time()),)
+        )
+        db.commit()
+        return db
+    except Exception:
+        db.close()
+        raise
 def record_divine(key, egg, location, at):
     if not PREDICTION_DB:
         return
     try:
-        with closing(prediction_connect()) as db, db:
-            db.execute("INSERT OR IGNORE INTO spawns VALUES (?, ?, ?, ?)", (key, clean(egg), clean(location), at))
-    except Exception:
-        app.logger.error("Prediction history write failed")
+        with prediction_connect() as db:
+            db.execute(
+                "INSERT INTO spawns (id, egg, location, ts) VALUES (%s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                (key, clean(egg), clean(location), float(at))
+            )
+    except Exception as exc:
+        app.logger.error(
+            "Prediction history write failed: %s",
+            type(exc).__name__
+        )
+
+
+
 
 def prediction_report(rows, now):
     heading = "🔮 YOUKO HUB PREDICTION\nការព្យាករណ៍ពង DIVINE\nរបាយការណ៍ប្រចាំ ៦ ថ្ងៃ | GMT+7\n\n"
@@ -230,17 +260,33 @@ def prediction_report(rows, now):
 
 def prediction_tick():
     now = time.time()
-    with closing(prediction_connect()) as db, db:
-        db.execute("BEGIN IMMEDIATE")
-        due = db.execute("SELECT next_at FROM schedule WHERE id=1").fetchone()[0]
+
+    with prediction_connect() as db:
+        due = db.execute(
+            "SELECT next_at FROM schedule WHERE id=1 FOR UPDATE"
+        ).fetchone()[0]
+
         if now < due:
             return False
-        rows = db.execute("SELECT egg, location, ts FROM spawns WHERE ts >= ? AND ts <= ? ORDER BY ts", (now-30*86400, now)).fetchall()
-        # Reserve before sending: avoid repeated posts even after a restart.
-        db.execute("UPDATE schedule SET next_at=? WHERE id=1", (now+PREDICTION_INTERVAL,))
-        db.execute("DELETE FROM spawns WHERE ts < ?", (now-90*86400,))
+
+        rows = db.execute(
+            "SELECT egg, location, ts FROM spawns WHERE ts >= %s AND ts <= %s ORDER BY ts",
+            (now - 30 * 86400, now)
+        ).fetchall()
+
+        db.execute(
+            "UPDATE schedule SET next_at=%s WHERE id=1",
+            (next_prediction_time(now),)
+        )
+
+        db.execute(
+            "DELETE FROM spawns WHERE ts < %s",
+            (now - 90 * 86400,)
+        )
+
     send_telegram(prediction_report(rows, now))
     return True
+
 
 def prediction_loop():
     while True:
