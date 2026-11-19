@@ -292,8 +292,11 @@ def prediction_loop():
     while True:
         try:
             prediction_tick()
-        except Exception:
-            app.logger.error("Prediction check or delivery failed")
+        except Exception as exc:
+            app.logger.error(
+                "Prediction error: %s",
+                type(exc).__name__
+            )
         time.sleep(60)
 
 def discord_worker():
