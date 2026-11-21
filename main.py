@@ -177,7 +177,7 @@ def send_discord_alert(message):
         },
         timeout=15,
     )
-    if not response.ok:
+    if not response.ok or not response.json().get("ok"):
         raise RuntimeError("Telegram delivery failed")
 
 import psycopg
@@ -189,15 +189,10 @@ from datetime import timedelta
 
 def next_prediction_time(now):
     current = datetime.fromtimestamp(now, TZ)
-    days = (5 - current.weekday()) % 7
-    target = (current + timedelta(days=days)).replace(
-        hour=8, minute=0, second=0, microsecond=0
-    )
-    if target <= current:
-        target += timedelta(days=7)
+    target = current.replace(hour=(current.hour // 6) * 6, minute=0, second=0, microsecond=0) + timedelta(hours=6)
     return target.timestamp()
 
-PREDICTION_MIN = 20
+PREDICTION_MIN = 20  # Minimum recorded Divine spawns before ranking
 
 def prediction_connect():
     db = psycopg.connect(
@@ -236,55 +231,68 @@ def record_divine(key, egg, location, at):
 
 
 def prediction_report(rows, now):
-    heading = "🔮 YOUKO HUB PREDICTION\nការព្យាករណ៍ពង DIVINE\nរបាយការណ៍ប្រចាំ ៦ ថ្ងៃ | GMT+7\n\n"
+    heading = (
+        "🔮 DIVINE SPAWN PREDICTION\n"
+        "📅 របាយការណ៍រៀងរាល់ ៦ ម៉ោង · GMT+7\n"
+        f"🕒 {datetime.fromtimestamp(now, TZ):%Y-%m-%d %H:%M}\n\n"
+    )
     if len(rows) < PREDICTION_MIN:
-        return heading + f"កំពុងប្រមូលទិន្នន័យ៖ {len(rows)}/{PREDICTION_MIN} ករណី។\nមិនទាន់មានទិន្នន័យគ្រប់គ្រាន់សម្រាប់ព្យាករណ៍ទេ។"
+        return (heading + f"📊 កំពុងប្រមូលទិន្នន័យ៖ {len(rows)}/{PREDICTION_MIN} ករណី\n"
+                "មិនទាន់មានទិន្នន័យគ្រប់គ្រាន់សម្រាប់ចំណាត់ថ្នាក់។\n"
+                "📡 Source: Discord notifier (SenZ V2)")
+
     counts = Counter(egg.casefold() for egg, loc, ts in rows)
     latest = {}
     for egg, loc, ts in rows:
-        latest[egg.casefold()] = (egg, loc, ts)
-    lines = [heading, f"📊 ប្រវត្តិ ៣០ ថ្ងៃ៖ {len(rows)} ករណី\n"]
+        key = egg.casefold()
+        if key not in latest or ts > latest[key][2]:
+            latest[key] = (egg, loc, ts)
+
+    lines = [heading, f"📊 Divine spawns (30 ថ្ងៃ): {len(rows)} ករណី\n"]
     for i, (key, count) in enumerate(counts.most_common(5), 1):
         egg, loc, ts = latest[key]
         pct = 100 * count / len(rows)
-        days = max(0, int((now-ts)/86400))
-        lines.append(f"{i}. {egg} — {pct:.1f}%\n{'█'*round(pct/10)}{'░'*(10-round(pct/10))}\n📍 {loc} · បាត់មុខ {days} ថ្ងៃ\n")
-    hours = Counter((datetime.fromtimestamp(ts, TZ).hour // 3)*3 for _, _, ts in rows)
-    def window(h):
-        return f"{h:02d}:00 – {(h+3)%24:02d}:00"
+        bars = max(1, round(pct / 10))
+        hours_ago = max(0, int((now - ts) / 3600))
+        lines.append(
+            f"{i}. 🥚 {egg} — {pct:.1f}% ({count})\n"
+            f"{'🟪' * bars}{'⬛' * (10 - bars)}\n"
+            f"📍 {loc} · ចុងក្រោយ {hours_ago} ម៉ោងមុន\n"
+        )
+
+    hours = Counter((datetime.fromtimestamp(ts, TZ).hour // 3) * 3 for _, _, ts in rows)
     peaks = hours.most_common(2)
-    lines.append("⏰ ចន្លោះម៉ោងប៉ាន់ស្មាន (តាមប្រវត្តិ)\n" + window(peaks[0][0]))
-    lines.append("\n📊 ចន្លោះម៉ោងដែលពងចេញញឹកញាប់\n" + "\n".join(window(h) for h, _ in peaks))
-    lines.append("\n⚠️ ភាគរយជាសមាមាត្រនៃប្រវត្តិដែល Bot បានឃើញ មិនមែនឱកាស Spawn ពិតប្រាកដទេ។ ម៉ោងយោងតាមពេលទទួលសារ។\nប្រភព៖ Discord notifier (SenZ V2)\nYOUKO HUB | Steal An Egg Notifier")
+    def window(hour):
+        return f"{hour:02d}:00 – {(hour + 3) % 24:02d}:00"
+    lines.append("⏰ Peak Spawn Time (តាមប្រវត្តិ)")
+    lines.extend(f"• {window(hour)} · {count} ករណី" for hour, count in peaks)
+    lines.append(
+        "\n⚠️ ភាគរយនេះគឺជាប្រេកង់ប្រវត្តិដែល Bot បានទទួល "
+        "មិនមែនជាឱកាស Spawn ពិតប្រាកដទេ។\n"
+        "📡 Source: Discord notifier (SenZ V2)\n"
+        "YOUKO HUB | Steal An Egg Notifier"
+    )
     return "\n".join(lines)
+
 
 def prediction_tick():
     now = time.time()
-
     with prediction_connect() as db:
-        due = db.execute(
+        due_row = db.execute(
             "SELECT next_at FROM schedule WHERE id=1 FOR UPDATE"
-        ).fetchone()[0]
-
-        if now < due:
+        ).fetchone()
+        if not due_row or now < due_row[0]:
             return False
-
         rows = db.execute(
             "SELECT egg, location, ts FROM spawns WHERE ts >= %s AND ts <= %s ORDER BY ts",
             (now - 30 * 86400, now)
         ).fetchall()
-
+        send_telegram(prediction_report(rows, now))
         db.execute(
             "UPDATE schedule SET next_at=%s WHERE id=1",
             (next_prediction_time(now),)
         )
-
-        db.execute(
-            "DELETE FROM spawns WHERE ts < %s",
-            (now - 90 * 86400,)
-        )
-
-    send_telegram(prediction_report(rows, now))
+        db.execute("DELETE FROM spawns WHERE ts < %s", (now - 90 * 86400,))
     return True
 
 
@@ -313,7 +321,7 @@ def discord_worker():
         if str(message.channel.id) != DISCORD_CHANNEL:
             return
 
-        if not (message.webhook_id or message.author.bot):
+        if message.author.id == client.user.id or not (message.webhook_id or message.author.bot):
             return
 
         for index, embed in enumerate(message.embeds):
